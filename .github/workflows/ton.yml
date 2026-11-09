@@ -1,0 +1,110 @@
+name: ton
+on:
+  workflow_dispatch:
+    inputs:
+      stimme:
+        description: "Stimme, z. B. bm_george"
+        required: true
+      abschnitte:
+        description: "Komma trennt Abschnitte, Strichpunkt trennt Jobs, z. B. 21-08,21-25;16-23"
+        required: true
+      gleichzeitig:
+        description: "Jobs gleichzeitig, 1 bis 5"
+        default: "5"
+permissions:
+  contents: write
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      gleich: ${{ steps.m.outputs.gleich }}
+    steps:
+      - id: m
+        env:
+          STIMME: ${{ inputs.stimme }}
+          ABSCHNITTE: ${{ inputs.abschnitte }}
+          GLEICH: ${{ inputs.gleichzeitig }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+          if not re.fullmatch(r"[a-z]{2}_[a-z0-9]+", os.environ["STIMME"]):
+              sys.exit("FEHLER Stimme")
+          teile = [t.strip() for t in os.environ["ABSCHNITTE"].split(";") if t.strip()]
+          alle = [f for t in teile for f in t.split(",")]
+          if not teile or any(not re.fullmatch(r"\d\d-\d\d", f) for f in alle) or len(alle) != len(set(alle)):
+              sys.exit("FEHLER Abschnitte: jeder genau einmal, Form 21-08")
+          gleich = max(1, min(5, int(os.environ["GLEICH"])))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as h:
+              h.write("matrix=" + json.dumps({"include": [{"nr": i, "teil": t} for i, t in enumerate(teile)]}) + "\n")
+              h.write("gleich=%d\n" % gleich)
+          print(len(teile), "Jobs,", len(alle), "Abschnitte,", gleich, "gleichzeitig")
+          PY
+  ton:
+    needs: plan
+    name: ton ${{ matrix.nr }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.plan.outputs.gleich) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          sparse-checkout: |
+            .github
+            liste.json
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - run: pip install -q kokoro-onnx soundfile
+      - name: Modell holen
+        run: |
+          curl -sSL --fail --retry 5 -o kokoro.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+          curl -sSL --fail --retry 5 -o voices.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+          ls -la kokoro.onnx voices.bin
+      - name: Ton erzeugen
+        env:
+          STIMME: ${{ inputs.stimme }}
+          TEIL: ${{ matrix.teil }}
+        run: python .github/ton.py "$STIMME" "$TEIL" aus liste.json
+      - name: Ergebnis ablegen
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ton-${{ matrix.nr }}
+          path: aus/
+          if-no-files-found: ignore
+          retention-days: 3
+          compression-level: 0
+          overwrite: true
+  merge:
+    needs: [plan, ton]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: ton-merge
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - id: laden
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ton-*
+          path: ${{ runner.temp }}/neu
+          merge-multiple: true
+      - name: Ins Repo schreiben
+        env:
+          STIMME: ${{ inputs.stimme }}
+          NEU: ${{ runner.temp }}/neu
+          GELADEN: ${{ steps.laden.outcome }}
+        run: python3 .github/merge.py "$STIMME" "$NEU" "$GELADEN"
